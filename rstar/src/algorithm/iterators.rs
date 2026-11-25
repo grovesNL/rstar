@@ -1,6 +1,7 @@
 use crate::algorithm::selection_functions::*;
 use crate::node::{ParentNode, RTreeNode};
 use crate::object::RTreeObject;
+use core::convert::Infallible;
 use core::mem::{replace, take};
 use core::ops::ControlFlow;
 use core::slice::{Iter, IterMut};
@@ -116,6 +117,57 @@ where
             current = self.ancestors.pop()?;
         }
     }
+
+    #[inline]
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut f = |acc: B, t: &'a T| ControlFlow::<Infallible, B>::Continue(f(acc, t));
+        // The rest of the current node first, then the rest of each ancestor, innermost first.
+        let ControlFlow::Continue(mut acc) =
+            try_fold_children(self.current.as_slice(), &self.func, init, &mut f);
+        for siblings in self.ancestors.into_iter().rev() {
+            let ControlFlow::Continue(next) =
+                try_fold_children(siblings.as_slice(), &self.func, acc, &mut f);
+            acc = next;
+        }
+
+        acc
+    }
+}
+
+/// Folds the elements selected by `func` in `children` and below them with `f`, in order, until `f`
+/// breaks.
+///
+/// Shared by [`SelectionIterator::fold`] and [`select_nodes`].
+fn try_fold_children<'a, T, Func, B, R, F>(
+    children: &'a [RTreeNode<T>],
+    func: &Func,
+    mut acc: B,
+    f: &mut F,
+) -> ControlFlow<R, B>
+where
+    T: RTreeObject,
+    Func: SelectionFunction<T>,
+    F: FnMut(B, &'a T) -> ControlFlow<R, B>,
+{
+    for child in children {
+        match child {
+            RTreeNode::Leaf(t) => {
+                if func.should_unpack_leaf(t) {
+                    acc = f(acc, t)?;
+                }
+            }
+            RTreeNode::Parent(data) => {
+                if func.should_unpack_parent(&data.envelope) {
+                    acc = try_fold_children(&data.children, func, acc, f)?;
+                }
+            }
+        }
+    }
+
+    ControlFlow::Continue(acc)
 }
 
 /// Internal iteration variant of [`SelectionIterator`]
@@ -129,40 +181,8 @@ where
     Func: SelectionFunction<T>,
     V: FnMut(&'a T) -> ControlFlow<B>,
 {
-    struct Args<'a, Func, V> {
-        func: &'a Func,
-        visitor: &'a mut V,
-    }
-
-    fn inner<'a, T, Func, V, B>(
-        parent: &'a ParentNode<T>,
-        args: &mut Args<'_, Func, V>,
-    ) -> ControlFlow<B>
-    where
-        T: RTreeObject,
-        Func: SelectionFunction<T>,
-        V: FnMut(&'a T) -> ControlFlow<B>,
-    {
-        for node in parent.children.iter() {
-            match node {
-                RTreeNode::Leaf(ref t) => {
-                    if args.func.should_unpack_leaf(t) {
-                        (args.visitor)(t)?;
-                    }
-                }
-                RTreeNode::Parent(ref data) => {
-                    if args.func.should_unpack_parent(&data.envelope) {
-                        inner(data, args)?;
-                    }
-                }
-            }
-        }
-
-        ControlFlow::Continue(())
-    }
-
     if !root.children.is_empty() && func.should_unpack_parent(&root.envelope) {
-        inner(root, &mut Args { func, visitor })?;
+        try_fold_children(&root.children, func, (), &mut |(), t| visitor(t))?;
     }
 
     ControlFlow::Continue(())
@@ -234,6 +254,54 @@ where
             current = self.ancestors.pop()?;
         }
     }
+
+    #[inline]
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut f = |acc: B, t: &'a mut T| ControlFlow::<Infallible, B>::Continue(f(acc, t));
+        // See `SelectionIterator::fold`.
+        let ControlFlow::Continue(mut acc) =
+            try_fold_children_mut(self.current.into_slice(), &self.func, init, &mut f);
+        for siblings in self.ancestors.into_iter().rev() {
+            let ControlFlow::Continue(next) =
+                try_fold_children_mut(siblings.into_slice(), &self.func, acc, &mut f);
+            acc = next;
+        }
+
+        acc
+    }
+}
+
+/// See [`try_fold_children`].
+fn try_fold_children_mut<'a, T, Func, B, R, F>(
+    children: &'a mut [RTreeNode<T>],
+    func: &Func,
+    mut acc: B,
+    f: &mut F,
+) -> ControlFlow<R, B>
+where
+    T: RTreeObject,
+    Func: SelectionFunction<T>,
+    F: FnMut(B, &'a mut T) -> ControlFlow<R, B>,
+{
+    for child in children {
+        match child {
+            RTreeNode::Leaf(t) => {
+                if func.should_unpack_leaf(t) {
+                    acc = f(acc, t)?;
+                }
+            }
+            RTreeNode::Parent(data) => {
+                if func.should_unpack_parent(&data.envelope) {
+                    acc = try_fold_children_mut(&mut data.children, func, acc, f)?;
+                }
+            }
+        }
+    }
+
+    ControlFlow::Continue(acc)
 }
 
 /// Internal iteration variant of [`SelectionIteratorMut`]
@@ -247,40 +315,8 @@ where
     Func: SelectionFunction<T>,
     V: FnMut(&'a mut T) -> ControlFlow<B>,
 {
-    struct Args<'a, Func, V> {
-        func: &'a Func,
-        visitor: &'a mut V,
-    }
-
-    fn inner<'a, T, Func, V, B>(
-        parent: &'a mut ParentNode<T>,
-        args: &mut Args<'_, Func, V>,
-    ) -> ControlFlow<B>
-    where
-        T: RTreeObject,
-        Func: SelectionFunction<T>,
-        V: FnMut(&'a mut T) -> ControlFlow<B>,
-    {
-        for node in parent.children.iter_mut() {
-            match node {
-                RTreeNode::Leaf(ref mut t) => {
-                    if args.func.should_unpack_leaf(t) {
-                        (args.visitor)(t)?;
-                    }
-                }
-                RTreeNode::Parent(ref mut data) => {
-                    if args.func.should_unpack_parent(&data.envelope) {
-                        inner(data, args)?;
-                    }
-                }
-            }
-        }
-
-        ControlFlow::Continue(())
-    }
-
     if !root.children.is_empty() && func.should_unpack_parent(&root.envelope) {
-        inner(root, &mut Args { func, visitor })?;
+        try_fold_children_mut(&mut root.children, func, (), &mut |(), t| visitor(t))?;
     }
 
     ControlFlow::Continue(())
@@ -295,13 +331,43 @@ mod test {
     use crate::test_utilities::{create_random_points, create_random_rectangles, SEED_1};
     use crate::SelectionFunction;
 
+    /// Selects points in the bottom half, but only in nodes that reach into the left half.
+    struct SelectFunc;
+
+    impl SelectionFunction<[f64; 2]> for SelectFunc {
+        fn should_unpack_parent(&self, envelope: &AABB<[f64; 2]>) -> bool {
+            envelope.lower()[0] < 0.5
+        }
+
+        fn should_unpack_leaf(&self, point: &[f64; 2]) -> bool {
+            point[1] < 0.5
+        }
+    }
+
+    fn sorted(mut points: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+        points.sort_unstable_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap());
+        points
+    }
+
     #[test]
     fn test_root_node_is_not_always_unpacked() {
+        use super::{select_nodes, select_nodes_mut};
+        use core::ops::ControlFlow;
+
         struct SelectNoneFunc {}
 
         impl SelectionFunction<[i32; 2]> for SelectNoneFunc {
             fn should_unpack_parent(&self, _: &AABB<[i32; 2]>) -> bool {
                 false
+            }
+        }
+
+        /// Panics when it tests a parent.
+        struct UntestedRootFunc {}
+
+        impl SelectionFunction<[i32; 2]> for UntestedRootFunc {
+            fn should_unpack_parent(&self, _: &AABB<[i32; 2]>) -> bool {
+                panic!("the root of an empty tree was tested");
             }
         }
 
@@ -313,6 +379,31 @@ mod test {
 
         let mut elements = tree.locate_with_selection_function_mut(SelectNoneFunc {});
         assert!(elements.next().is_none());
+        drop(elements);
+
+        let result = select_nodes(tree.root(), &SelectNoneFunc {}, &mut ControlFlow::Break);
+        assert_eq!(result, ControlFlow::Continue(()));
+        let result = select_nodes_mut(tree.root_mut(), &SelectNoneFunc {}, &mut ControlFlow::Break);
+        assert_eq!(result, ControlFlow::Continue(()));
+
+        // The root of an empty tree isn't tested at all.
+        let mut tree = RTree::new();
+        assert!(tree
+            .locate_with_selection_function(UntestedRootFunc {})
+            .next()
+            .is_none());
+        assert!(tree
+            .locate_with_selection_function_mut(UntestedRootFunc {})
+            .next()
+            .is_none());
+        let result = select_nodes(tree.root(), &UntestedRootFunc {}, &mut ControlFlow::Break);
+        assert_eq!(result, ControlFlow::Continue(()));
+        let result = select_nodes_mut(
+            tree.root_mut(),
+            &UntestedRootFunc {},
+            &mut ControlFlow::Break,
+        );
+        assert_eq!(result, ControlFlow::Continue(()));
     }
 
     /// `should_unpack_leaf` may be expensive, so it must only be called for the leaves an
@@ -456,7 +547,8 @@ mod test {
         }
     }
 
-    /// The iterators test the children of each node in order.
+    /// The iterators test the children of each node in order, and return its elements in order,
+    /// whether they're consumed with `next`, `fold` or both.
     #[test]
     fn test_children_are_tested_in_order() {
         use crate::node::{ParentNode, RTreeNode};
@@ -483,8 +575,9 @@ mod test {
             }
         }
 
-        /// Checks that `calls` tests the children of `parent`, and of each node below it, in order.
-        fn assert_tested_in_order(parent: &ParentNode<[f64; 2]>, calls: &[Call]) {
+        /// Checks that `calls` tests the children of `parent`, and of each node below it, in order,
+        /// and that `returned` has their elements in order.
+        fn assert_in_order(parent: &ParentNode<[f64; 2]>, calls: &[Call], returned: &[[f64; 2]]) {
             let children: Vec<_> = parent
                 .children()
                 .iter()
@@ -500,9 +593,23 @@ mod test {
                 .collect();
             assert_eq!(tested, children);
 
+            let elements: Vec<_> = children
+                .iter()
+                .filter_map(|child| match child {
+                    Call::Leaf(point) => Some(*point),
+                    Call::Parent(_) => None,
+                })
+                .collect();
+            let in_returned: Vec<_> = returned
+                .iter()
+                .copied()
+                .filter(|point| elements.contains(point))
+                .collect();
+            assert_eq!(in_returned, elements);
+
             for child in parent.children() {
                 if let RTreeNode::Parent(data) = child {
-                    assert_tested_in_order(data, calls);
+                    assert_in_order(data, calls, returned);
                 }
             }
         }
@@ -510,13 +617,120 @@ mod test {
         let mut tree = RTree::bulk_load(create_random_points(1000, SEED_1));
         let calls = RefCell::new(Vec::new());
 
-        tree.locate_with_selection_function(RecordingFunc(&calls))
-            .for_each(|_| {});
-        assert_tested_in_order(tree.root(), &calls.take());
+        // `fold` continues where `next` left off.
+        for consumed in [0, 1, tree.size() / 2, tree.size() - 1, tree.size()] {
+            let mut returned = Vec::new();
+            let mut iter = tree.locate_with_selection_function(RecordingFunc(&calls));
+            for point in iter.by_ref().take(consumed) {
+                returned.push(*point);
+            }
 
-        tree.locate_with_selection_function_mut(RecordingFunc(&calls))
-            .for_each(|_| {});
-        assert_tested_in_order(tree.root(), &calls.take());
+            iter.for_each(|point| returned.push(*point));
+            assert_in_order(tree.root(), &calls.take(), &returned);
+
+            let mut returned = Vec::new();
+            let mut iter = tree.locate_with_selection_function_mut(RecordingFunc(&calls));
+            for point in iter.by_ref().take(consumed) {
+                returned.push(*point);
+            }
+
+            iter.for_each(|point| returned.push(*point));
+            assert_in_order(tree.root(), &calls.take(), &returned);
+        }
+    }
+
+    /// `fold` returns the same elements as `next`, also when it continues where `next` left off.
+    #[test]
+    fn test_fold_returns_the_same_elements_as_next() {
+        let points = create_random_points(1000, SEED_1);
+        let mut tree = RTree::bulk_load(points.clone());
+        let mut selected = Vec::new();
+        for point in tree.locate_with_selection_function(SelectFunc) {
+            selected.push(*point);
+        }
+
+        let selected = sorted(selected);
+        // Unpacking every parent would select more.
+        let in_bottom_half = points
+            .iter()
+            .filter(|point| SelectFunc.should_unpack_leaf(point))
+            .count();
+        assert!(!selected.is_empty() && selected.len() < in_bottom_half);
+
+        for consumed in [0, 1, selected.len() / 2, selected.len() - 1, selected.len()] {
+            let mut returned = Vec::new();
+            let mut iter = tree.locate_with_selection_function(SelectFunc);
+            for point in iter.by_ref().take(consumed) {
+                returned.push(*point);
+            }
+
+            iter.for_each(|point| returned.push(*point));
+            assert_eq!(sorted(returned), selected);
+
+            let mut returned = Vec::new();
+            let mut iter = tree.locate_with_selection_function_mut(SelectFunc);
+            for point in iter.by_ref().take(consumed) {
+                returned.push(*point);
+            }
+
+            iter.for_each(|point| returned.push(*point));
+            assert_eq!(sorted(returned), selected);
+        }
+    }
+
+    /// `select_nodes` and `select_nodes_mut` visit the elements that the iterators return, and stop
+    /// when the visitor breaks.
+    #[test]
+    fn test_select_nodes() {
+        use super::{select_nodes, select_nodes_mut};
+        use core::ops::ControlFlow;
+
+        let mut tree = RTree::bulk_load(create_random_points(1000, SEED_1));
+        let mut selected = Vec::new();
+        for point in tree.locate_with_selection_function(SelectFunc) {
+            selected.push(*point);
+        }
+
+        let selected = sorted(selected);
+        let mut visited = Vec::new();
+        let result = select_nodes(tree.root(), &SelectFunc, &mut |point: &[f64; 2]| {
+            visited.push(*point);
+            ControlFlow::<()>::Continue(())
+        });
+        assert_eq!(result, ControlFlow::Continue(()));
+        assert_eq!(sorted(visited), selected);
+
+        let mut visited = Vec::new();
+        let result = select_nodes_mut(tree.root_mut(), &SelectFunc, &mut |point: &mut [f64; 2]| {
+            visited.push(*point);
+            ControlFlow::<()>::Continue(())
+        });
+        assert_eq!(result, ControlFlow::Continue(()));
+        assert_eq!(sorted(visited), selected);
+
+        for stop in [1, selected.len() / 2, selected.len()] {
+            let mut visited = 0;
+            let result = select_nodes(tree.root(), &SelectFunc, &mut |_| {
+                visited += 1;
+                if visited == stop {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            assert_eq!((result, visited), (ControlFlow::Break(()), stop));
+
+            let mut visited = 0;
+            let result = select_nodes_mut(tree.root_mut(), &SelectFunc, &mut |_| {
+                visited += 1;
+                if visited == stop {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            assert_eq!((result, visited), (ControlFlow::Break(()), stop));
+        }
     }
 
     /// After a selection function panics, the iterators may skip elements. They never return an
@@ -560,6 +774,19 @@ mod test {
         let mut iter = tree.locate_with_selection_function_mut(PanicOnceFunc(Cell::new(true)));
         assert!(catch_unwind(AssertUnwindSafe(|| iter.next().is_some())).is_err());
         assert_distinct(iter.map(|p| *p).collect());
+
+        // The same, continuing with `fold`.
+        let mut iter = tree.locate_with_selection_function(PanicOnceFunc(Cell::new(true)));
+        assert!(catch_unwind(AssertUnwindSafe(|| iter.next().is_some())).is_err());
+        let mut points = Vec::new();
+        iter.for_each(|point| points.push(*point));
+        assert_distinct(points);
+
+        let mut iter = tree.locate_with_selection_function_mut(PanicOnceFunc(Cell::new(true)));
+        assert!(catch_unwind(AssertUnwindSafe(|| iter.next().is_some())).is_err());
+        let mut points = Vec::new();
+        iter.for_each(|point| points.push(*point));
+        assert_distinct(points);
     }
 
     #[test]
